@@ -7,7 +7,7 @@ import json
 from flask import Flask, jsonify, render_template_string
 from instagrapi import Client
 from instagrapi.exceptions import RateLimitError
-
+from flask import Flask, jsonify, render_template_string, make_response
 SESSION_ID_1 = os.getenv("SESSION_ID_1")
 SESSION_ID_2 = os.getenv("SESSION_ID_2")
 SESSION_ID_3 = os.getenv("SESSION_ID_3")
@@ -25,7 +25,9 @@ BURST_COUNT = int(os.getenv("BURST_COUNT", "1"))
 SELF_PING_INTERVAL = int(os.getenv("SELF_PING_INTERVAL", "60"))
 COOLDOWN_ON_ERROR = int(os.getenv("COOLDOWN_ON_ERROR", "300"))
 TITLE_CHECK_COOLDOWN = int(os.getenv("TITLE_CHECK_COOLDOWN", "20"))
-
+live_logs = []
+MAX_LIVE_LOGS = 2000
+log_seq = 0
 DOC_ID = os.getenv("DOC_ID", "29088580780787855")
 CSRF_TOKEN = os.getenv("CSRF_TOKEN", "")
 
@@ -216,7 +218,7 @@ DASHBOARD_HTML = """
             if (l.includes("❌") || l.includes("failed")) return "err";
             if (l.includes("⚠")) return "warn";
             if (l.includes("✅") || l.includes("started")) return "ok";
-            if (l.includes("🔐") || l.includes("🔁") || l.includes("http")) return "info";
+            if (l.includes("🔐") || l.includes("🔁") || l.includes("http") || l.includes("fetch")) return "info";
             return "muted";
         }
 
@@ -231,6 +233,15 @@ DASHBOARD_HTML = """
             const el = document.getElementById(id);
             const wasNearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
             el.innerHTML = (lines || []).map(line => `<div class="line ${cls(line)}">${escapeHtml(line)}</div>`).join("");
+            if (wasNearBottom) el.scrollTop = el.scrollHeight;
+        }
+
+        function renderLive(lines) {
+            const el = document.getElementById("livefeed");
+            const wasNearBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+            el.innerHTML = (lines || []).map(item => {
+                return `<div class="line ${cls(item.line)}">[${escapeHtml(item.session)}] ${escapeHtml(item.line)}</div>`;
+            }).join("");
             if (wasNearBottom) el.scrollTop = el.scrollHeight;
         }
 
@@ -265,7 +276,7 @@ DASHBOARD_HTML = """
             document.getElementById("groupsPanel").innerHTML = groups.length
                 ? groups.map(g => `<span class="pill">${escapeHtml(g)}</span>`).join("")
                 : '<div class="setting-row">No groups configured</div>';
-
+    
             const titles = settings.NC_TITLES || [];
             document.getElementById("titlesPanel").innerHTML = titles.length
                 ? titles.map(t => `<span class="pill">${escapeHtml(t)}</span>`).join("")
@@ -274,7 +285,7 @@ DASHBOARD_HTML = """
 
         async function fetchLogs() {
             try {
-                const res = await fetch('/logs');
+                const res = await fetch('/logs?_=' + Date.now(), { cache: 'no-store' });
                 const data = await res.json();
                 renderSummary(data);
                 renderSettings(data.settings || {});
@@ -283,6 +294,7 @@ DASHBOARD_HTML = """
                 renderLines("acc2", data.logs.acc2 || []);
                 renderLines("acc3", data.logs.acc3 || []);
                 renderLines("acc4", data.logs.acc4 || []);
+                renderLive(data.logs.live || []);
             } catch (e) {
                 console.error("Dashboard fetch error:", e);
             }
@@ -290,7 +302,7 @@ DASHBOARD_HTML = """
 
         function refreshNow() { fetchLogs(); }
 
-        function toggleAutoRefresh() {
+    function toggleAutoRefresh() {
             autoRefresh = !autoRefresh;
             document.getElementById("toggleBtn").innerText = autoRefresh
                 ? "Pause auto refresh"
@@ -306,13 +318,25 @@ DASHBOARD_HTML = """
 </html>
 """
 
-def _push_log(session, msg):
+def _push_log(session, line):
+    global log_seq
     if session not in session_logs:
         session = "system"
+
     with logs_lock:
-        session_logs[session].append(msg)
+        session_logs[session].append(line)
         if len(session_logs[session]) > MAX_SESSION_LOGS:
             session_logs[session].pop(0)
+
+        log_seq += 1
+        live_logs.append({
+            "seq": log_seq,
+            "ts": int(time.time()),
+            "session": session,
+            "line": line
+        })
+        if len(live_logs) > MAX_LIVE_LOGS:
+            live_logs.pop(0)
 
 def log(msg, session="system"):
     line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -364,15 +388,17 @@ def logs():
             "acc1": session_logs["acc1"][-200:],
             "acc2": session_logs["acc2"][-200:],
             "acc3": session_logs["acc3"][-200:],
-            "acc4": session_logs["acc4"][-200:]
+            "acc4": session_logs["acc4"][-200:],
+            "live": live_logs[-400:]
         }
 
     stats = {
         key: {
-            "total": len(val),
-            "last": val[-1] if val else None
+            "total": len(val) if isinstance(val, list) else 0,
+            "last": val[-1] if isinstance(val, list) and val else None
         }
         for key, val in data.items()
+        if key != "live"
     }
 
     settings = {
@@ -388,12 +414,17 @@ def logs():
         "NC_TITLES": [t.strip() for t in NC_TITLES_RAW.split(",") if t.strip()]
     }
 
-    return jsonify({
+    resp = make_response(jsonify({
         "ok": True,
         "logs": data,
         "stats": stats,
-        "settings": settings
-    })
+        "settings": settings,
+        "last_seq": live_logs[-1]["seq"] if live_logs else 0
+    }))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 @app.route("/dashboard")
 def dashboard():
